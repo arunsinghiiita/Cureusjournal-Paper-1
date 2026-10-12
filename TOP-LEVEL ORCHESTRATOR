@@ -1,0 +1,124 @@
+# --------------------------------------------------------------------------
+# 6. TOP-LEVEL ORCHESTRATOR
+# --------------------------------------------------------------------------
+ 
+class EdgeIoTNode:
+    """Wires the four architectural layers together and exposes a simple
+    run() loop, analogous to the main firmware loop on the target device."""
+ 
+    def __init__(self, bits: int = 8, mode: str = "int8", sample_rate_hz: float = 10.0):
+        self.sensor = SensorNode(sample_rate_hz=sample_rate_hz)
+        self.model = QuantizedNeuralNet(bits=bits, mode=mode)
+        self.engine = EdgeInferenceEngine(self.model)
+        self.broker = MessageBroker()
+        self.cloud = CloudSync(batch_size=5)
+        self.broker.subscribe("node/anomaly", self.cloud.on_message)
+        self.results: List[InferenceResult] = []
+ 
+    def run(self, n_samples: int) -> List[InferenceResult]:
+        for _ in range(n_samples):
+            reading = self.sensor.read()
+            result = self.engine.infer(reading)
+            self.results.append(result)
+            self.broker.publish("node/anomaly", {
+                "t": reading.timestamp,
+                "prediction": result.prediction,
+                "probability": round(result.probability, 4),
+                "latency_ms": round(result.latency_ms, 4),
+            })
+        self.cloud.flush()
+        return self.results
+ 
+    def evaluation_metrics(self) -> Dict[str, float]:
+        tp = fp = tn = fn = 0
+        for r in self.results:
+            y, yhat = r.reading.label, r.prediction
+            if y == 1 and yhat == 1:
+
+                tp += 1
+            elif y == 0 and yhat == 1:
+                fp += 1
+            elif y == 0 and yhat == 0:
+                tn += 1
+            else:
+                fn += 1
+        n = max(1, len(self.results))
+        accuracy = (tp + tn) / n
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+        metrics = self.engine.monitor.summary()
+        metrics.update({
+            "accuracy": accuracy, "precision": precision,
+            "recall": recall, "f1": f1,
+            "model_size_bytes": self.model.model_size_bytes(),
+            "bits": self.model.bits,
+            "mode": self.model.mode,
+        })
+        return metrics
+ 
+ 
+if __name__ == "__main__":
+    node = EdgeIoTNode(bits=8, mode="int8")
+    node.run(500)
+    print(json.dumps(node.evaluation_metrics(), indent=2))
+
+
+Appendix B. Experiment Harness - run_experiments.py
+
+The following script executes the quantization sweep described in Section 6.2 and writes the summary CSV used to produce Table 3 and Figures 3-6.
+
+"""
+run_experiments.py
+===================
+Runs the EdgeIoTNode simulation across quantization configurations and
+dataset sizes, and writes results to CSV for use in the paper's tables and
+figures.
+"""
+import csv
+import statistics
+from edge_ai_iot_system import EdgeIoTNode
+ 
+N_SAMPLES = 1000
+N_REPEATS = 5
+CONFIGS = [
+    ("fp32", 32),
+    ("int8", 8),
+    ("int8", 4),
+    ("int8", 2),
+]
+ 
+rows = []
+for mode, bits in CONFIGS:
+    accs, prec, rec, f1s, lat_mean, lat_p95, energy_mean, energy_tot = ([] for _ in range(8))
+    for rep in range(N_REPEATS):
+        node = EdgeIoTNode(bits=bits, mode=mode)
+        node.sensor._t = rep * 3.7  # vary the phase across repeats
+        node.run(N_SAMPLES)
+        m = node.evaluation_metrics()
+        accs.append(m["accuracy"]); prec.append(m["precision"]); rec.append(m["recall"])
+        f1s.append(m["f1"]); lat_mean.append(m["mean_latency_ms"]); lat_p95.append(m["p95_latency_ms"])
+        energy_mean.append(m["mean_energy_uj"]); energy_tot.append(m["total_energy_mj"])
+    model_size = EdgeIoTNode(bits=bits, mode=mode).model.model_size_bytes()
+    row = {
+        "mode": mode, "bits": bits,
+        "accuracy": statistics.mean(accs),
+        "precision": statistics.mean(prec),
+        "recall": statistics.mean(rec),
+        "f1": statistics.mean(f1s),
+        "mean_latency_ms": statistics.mean(lat_mean),
+        "p95_latency_ms": statistics.mean(lat_p95),
+        "mean_energy_uj": statistics.mean(energy_mean),
+        "total_energy_mj": statistics.mean(energy_tot),
+        "model_size_bytes": model_size,
+    }
+    rows.append(row)
+
+    print(row)
+ 
+with open("../figures_data.csv", "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=list(rows.keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+ 
+print("Wrote ../figures_data.csv")
