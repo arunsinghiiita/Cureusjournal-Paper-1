@@ -1,0 +1,64 @@
+# --------------------------------------------------------------------------
+# 3. EDGE INFERENCE ENGINE + RESOURCE MONITOR
+# --------------------------------------------------------------------------
+ 
+@dataclass
+class InferenceResult:
+    reading: SensorReading
+    prediction: int
+    probability: float
+    latency_ms: float
+
+    energy_uj: float
+ 
+ 
+class ResourceMonitor:
+    """Tracks per-inference latency and a physically-motivated energy proxy.
+ 
+    Energy is estimated as E = P_active * t_active + P_idle * t_idle, using
+    published-order-of-magnitude active/idle power draw for a Cortex-M4
+    class MCU running CMSIS-NN kernels (illustrative values, µJ scale).
+    """
+ 
+    ACTIVE_POWER_MW = {8: 38.0, 4: 30.0, 2: 24.0, 32: 96.0}  # bits -> mW
+ 
+    def __init__(self):
+        self.latencies_ms: List[float] = []
+        self.energies_uj: List[float] = []
+ 
+    def record(self, latency_ms: float, bits: int):
+        power_mw = self.ACTIVE_POWER_MW.get(bits, 96.0)
+        energy_uj = power_mw * (latency_ms / 1000.0) * 1000.0
+        self.latencies_ms.append(latency_ms)
+        self.energies_uj.append(energy_uj)
+        return energy_uj
+ 
+    def summary(self) -> Dict[str, float]:
+        if not self.latencies_ms:
+            return {}
+        return {
+            "mean_latency_ms": statistics.mean(self.latencies_ms),
+            "p95_latency_ms": sorted(self.latencies_ms)[int(0.95 * len(self.latencies_ms)) - 1],
+            "mean_energy_uj": statistics.mean(self.energies_uj),
+            "total_energy_mj": sum(self.energies_uj) / 1000.0,
+        }
+ 
+ 
+class EdgeInferenceEngine:
+    def __init__(self, model: QuantizedNeuralNet):
+        self.model = model
+        self.monitor = ResourceMonitor()
+ 
+    def infer(self, reading: SensorReading) -> InferenceResult:
+        t0 = time.perf_counter()
+        pred, prob = self.model.predict(reading)
+        # Emulate deterministic MCU-cycle cost proportional to bit-width
+        # (wider datapaths => more cycles on a narrow SIMD/CMSIS-NN kernel),
+
+        # since host timing alone is not representative of MCU timing.
+        cycles_penalty = {2: 0.9, 4: 1.0, 8: 1.35, 32: 4.2}.get(self.model.bits, 1.0)
+        t1 = time.perf_counter()
+        host_ms = (t1 - t0) * 1000.0
+        synthetic_latency_ms = max(host_ms, 0.02) * cycles_penalty * 18.0
+        energy = self.monitor.record(synthetic_latency_ms, self.model.bits)
+        return InferenceResult(reading, pred, prob, synthetic_latency_ms, energy)
