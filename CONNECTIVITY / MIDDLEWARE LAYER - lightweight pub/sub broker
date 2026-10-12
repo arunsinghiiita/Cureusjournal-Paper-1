@@ -1,0 +1,17 @@
+# --------------------------------------------------------------------------
+# 4. CONNECTIVITY / MIDDLEWARE LAYER - lightweight pub/sub broker
+# --------------------------------------------------------------------------
+ 
+class MessageBroker:
+    """Minimal in-process publish/subscribe broker standing in for an
+    MQTT/CoAP broker between the edge node and the gateway/cloud."""
+ 
+    def __init__(self):
+        self._topics: Dict[str, List[Callable]] = {}
+ 
+    def subscribe(self, topic: str, handler: Callable):
+        self._topics.setdefault(topic, []).append(handler)
+ 
+    def publish(self, topic: str, payload: dict):
+        for handler in self._topics.get(topic, []):
+            handler(payload)
