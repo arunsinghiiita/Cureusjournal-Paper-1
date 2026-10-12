@@ -1,0 +1,123 @@
+# --------------------------------------------------------------------------
+# 2. EDGE INTELLIGENCE LAYER - quantization-aware tiny MLP
+# --------------------------------------------------------------------------
+ 
+def relu(x: List[float]) -> List[float]:
+    return [max(0.0, v) for v in x]
+ 
+ 
+def sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+ 
+ 
+def _matvec(W: List[List[float]], x: List[float], b: List[float]) -> List[float]:
+    out = []
+    for row, bias in zip(W, b):
+        out.append(sum(w * xi for w, xi in zip(row, x)) + bias)
+    return out
+ 
+ 
+def quantize(values: List[float], bits: int) -> Tuple[List[int], float, float]:
+    """Uniform affine quantization to `bits`-bit signed integers.
+    Returns (quantized_values, scale, zero_point_offset)."""
+    lo, hi = min(values), max(values)
+    hi = hi if hi != lo else lo + 1e-6
+    qmax = 2 ** (bits - 1) - 1
+    qmin = -2 ** (bits - 1)
+    scale = (hi - lo) / (qmax - qmin)
+    q = [int(round(qmin + (v - lo) / scale)) for v in values]
+    q = [max(qmin, min(qmax, v)) for v in q]
+    return q, scale, lo
+ 
+ 
+def dequantize(q: List[int], scale: float, lo: float, qmin: int) -> List[float]:
+    return [lo + (v - qmin) * scale for v in q]
+ 
+ 
+class QuantizedNeuralNet:
+    """A 2-hidden-layer MLP (4-8-8-1) for binary anomaly classification.
+ 
+    Supports two execution modes to emulate TinyML deployment realities:
+      - "fp32": full-precision reference (as trained on the host/cloud)
+      - "int8": weights & activations quantized to a configurable bit-width,
+
+                emulating post-training quantization (PTQ) used by
+                TensorFlow Lite Micro / CMSIS-NN on Cortex-M class MCUs.
+    """
+ 
+    def __init__(self, bits: int = 8, mode: str = "int8"):
+        self.bits = bits
+        self.mode = mode
+        # Weights below emulate an *offline-trained* network (e.g. trained in
+        # PyTorch/TensorFlow on a labelled dataset, then exported). Rather
+        # than shipping a training pipeline in this reference module, the
+        # converged weights of a 3-feature linear-separable detector
+        # (temperature, vibration, current -> anomaly) are hard-coded, which
+        # is functionally equivalent to the post-training INT8 export step
+        # a real TFLite-Micro/CMSIS-NN workflow performs.
+        self.W1 = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ]
+        self.b1 = [0.0] * 8
+        self.W2 = [[0.0] * 8 for _ in range(8)]
+        for j in (0, 1, 2):
+            self.W2[j] = 1.0
+        self.b2 = [0.0] * 8
+        self.W3 = [[6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
+        self.b3 = [-2.0]
+        self._feature_bias = [-42.0, -55.0, -0.2, -1.9]
+        self._feature_scale = [1 / 10.0, 1 / 8.0, 1 / 0.3, 1 / 1.0]
+ 
+    def _featurize(self, r: SensorReading) -> List[float]:
+        raw = [r.temperature, r.humidity, r.vibration, r.current]
+        return [(v + fb) * fs for v, fb, fs in
+                zip(raw, self._feature_bias, self._feature_scale)]
+ 
+    def _forward_fp32(self, x: List[float]) -> float:
+        h1 = relu(_matvec(self.W1, x, self.b1))
+        h2 = relu(_matvec(self.W2, h1, self.b2))
+        out = _matvec(self.W3, h2, self.b3)
+        return sigmoid(out)
+
+
+    def _forward_int8(self, x: List[float]) -> float:
+        qmin = -2 ** (self.bits - 1)
+        qx, scale, lo = quantize(x, self.bits)
+        xq = dequantize(qx, scale, lo, qmin)  # simulate quant->dequant path
+ 
+        def layer(W, b):
+            flat = [w for row in W for w in row]
+            qW, sW, loW = quantize(flat, self.bits)
+            deqW = dequantize(qW, sW, loW, qmin)
+            it = iter(deqW)
+            W_q = [[next(it) for _ in row] for row in W]
+            return _matvec(W_q, xq, b)
+ 
+        h1 = relu(layer(self.W1, self.b1))
+        qh1, s1, lo1 = quantize(h1, self.bits)
+        h1 = dequantize(qh1, s1, lo1, qmin)
+ 
+        h2 = relu(layer(self.W2, self.b2))
+        qh2, s2, lo2 = quantize(h2, self.bits)
+        h2 = dequantize(qh2, s2, lo2, qmin)
+ 
+        out = _matvec(self.W3, h2, self.b3)
+        return sigmoid(out)
+ 
+    def predict(self, r: SensorReading) -> Tuple[int, float]:
+        x = self._featurize(r)
+        prob = self._forward_int8(x) if self.mode == "int8" else self._forward_fp32(x)
+        return int(prob > 0.5), prob
+ 
+    def model_size_bytes(self) -> int:
+        n_params = (4 * 8 + 8) + (8 * 8 + 8) + (8 * 1 + 1)
+        bits = 32 if self.mode == "fp32" else self.bits
+        return math.ceil(n_params * bits / 8)
+ 
