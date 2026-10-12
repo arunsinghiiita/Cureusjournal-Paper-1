@@ -1,0 +1,26 @@
+# --------------------------------------------------------------------------
+# 5. APPLICATION / CLOUD LAYER
+# --------------------------------------------------------------------------
+ 
+class CloudSync:
+    """Batches anomaly alerts and periodically 'uploads' (here: buffers)
+    them, modeling the store-and-forward behaviour used to save radio
+    energy on constrained links (e.g., LoRaWAN, NB-IoT)."""
+ 
+    def __init__(self, batch_size: int = 5):
+        self.batch_size = batch_size
+        self._buffer: List[dict] = []
+        self.uploaded_batches: List[List[dict]] = []
+ 
+    def on_message(self, payload: dict):
+        if payload.get("prediction") == 1:
+            self._buffer.append(payload)
+
+        if len(self._buffer) >= self.batch_size:
+            self.flush()
+ 
+    def flush(self):
+        if self._buffer:
+            self.uploaded_batches.append(self._buffer)
+            self._buffer = []
+ 
